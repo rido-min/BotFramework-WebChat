@@ -8,10 +8,12 @@ Message delivery in Web Chat is a bidirectional process that handles both outgoi
 
 ## Key Components in Message Delivery
 
-### 1. Direct Line Connection
+### 1. Direct Line Connection & WebSocket Layer
 - **Protocol**: HTTP/WebSocket-based communication with Bot Framework
 - **Endpoints**: `/conversations/{conversationId}/activities`
 - **Transport**: WebSocket for real-time incoming messages, HTTP for outgoing messages
+- **WebSocket URL**: `wss://directline.botframework.com/v3/directline/conversations/{conversationId}/stream`
+- **Observable Interface**: DirectLineJS exposes `activity$` and `connectionStatus$` streams
 
 ### 2. Redux State Management
 - **Store**: Centralized state containing all activities/messages
@@ -22,6 +24,7 @@ Message delivery in Web Chat is a bidirectional process that handles both outgoi
 - **Side Effects**: Handles async operations like network calls
 - **Business Logic**: Message ordering, retry logic, connection management
 - **Event Coordination**: Manages complex workflows between multiple actions
+- **WebSocket Management**: Handles subscription lifecycle and reconnection logic
 
 ## Outgoing Message Flow (User → Bot)
 
@@ -157,23 +160,304 @@ Message delivery in Web Chat is a bidirectional process that handles both outgoi
    };
    ```
 
+## WebSocket Implementation Deep Dive
+
+### Connection Establishment
+
+The WebSocket connection in BotFramework-WebChat is managed through the `botframework-directlinejs` library, which abstracts the low-level WebSocket operations and provides a reactive Observable interface.
+
+**Connection Process:**
+
+1. **Lazy Connection**: WebSocket connection is not established until the first subscriber attaches to `directLine.activity$`
+2. **Authentication**: Uses Bearer token passed during DirectLine initialization
+3. **Handshake**: Standard WebSocket handshake with additional Bot Framework headers
+4. **Stream URL**: `wss://directline.botframework.com/v3/directline/conversations/{conversationId}/stream`
+
+```typescript
+// Simplified connection establishment flow
+const directLine = new DirectLine({
+  token: 'your-directline-token',
+  webSocket: window.WebSocket // Can be polyfilled for Node.js environments
+});
+
+// This triggers WebSocket connection establishment
+const subscription = directLine.activity$.subscribe({
+  next: activity => console.log('Received:', activity),
+  error: error => console.error('WebSocket error:', error),
+  complete: () => console.log('WebSocket connection closed')
+});
+```
+
+### Observable Stream Architecture
+
+DirectLineJS exposes two primary Observable streams:
+
+**1. Activity Stream (`activity$`)**
+```typescript
+// Type: Observable<DirectLineActivity>
+directLine.activity$.subscribe({
+  next: (activity) => {
+    // Handles incoming messages, typing indicators, conversation updates
+    // Each WebSocket frame containing an activity triggers this callback
+    console.log('Activity received:', {
+      type: activity.type,           // 'message', 'typing', 'conversationUpdate'
+      from: activity.from,           // { id, name, role }
+      text: activity.text,           // Message content
+      timestamp: activity.timestamp, // ISO 8601 timestamp
+      channelData: activity.channelData // Bot-specific data
+    });
+  }
+});
+```
+
+**2. Connection Status Stream (`connectionStatus$`)**
+```typescript
+// Type: Observable<ConnectionStatus>
+// ConnectionStatus: 0=Uninitialized, 1=Connecting, 2=Online, 3=Disconnected
+directLine.connectionStatus$.subscribe({
+  next: (status) => {
+    switch(status) {
+      case 0: console.log('Uninitialized'); break;
+      case 1: console.log('Connecting...'); break;
+      case 2: console.log('Connected and online'); break;
+      case 3: console.log('Disconnected'); break;
+    }
+  }
+});
+```
+
+### Saga Integration with Observables
+
+Web Chat uses Redux-Saga to convert Observable streams into Redux actions:
+
+```typescript
+// observeEach.js - Observable to Saga bridge
+function observeEachEffect(observable, saga) {
+  return call(function* observeEach() {
+    const queue = createPromiseQueue();
+    const subscription = observable.subscribe({ 
+      next: queue.push  // Queue each Observable emission
+    });
+
+    try {
+      for (;;) {
+        const result = yield call(queue.shift); // Wait for next emission
+        yield call(saga, result);               // Process with saga
+      }
+    } finally {
+      subscription.unsubscribe(); // Cleanup on cancellation
+    }
+  });
+}
+
+// Usage in observeActivitySaga.ts
+function* observeActivity({ directLine, userID }) {
+  yield observeEach(directLine.activity$, function* (activity) {
+    // Process each WebSocket message through saga
+    activity = patchActivityData(activity, userID);
+    yield put(queueIncomingActivity(activity));
+  });
+}
+```
+
+### Connection Lifecycle Management
+
+**whileConnected Pattern:**
+```typescript
+// whileConnected.ts - Lifecycle management
+function whileConnectedEffect(fn, ...args) {
+  return call(function* whileConnected() {
+    for (;;) {
+      // Wait for connection establishment
+      const { payload: { directLine }, meta: { userID, username } } = 
+        yield take([CONNECT_FULFILLING, RECONNECT_FULFILLING]);
+
+      // Start the provided saga with connection
+      const task = yield fork(fn, { directLine, userID, username }, ...args);
+
+      // Wait for disconnection or reconnection request
+      yield take([DISCONNECT_PENDING, RECONNECT_PENDING]);
+      
+      // Cancel active tasks when connection changes
+      yield cancel(task);
+    }
+  });
+}
+```
+
+### Error Handling & Reconnection
+
+**Automatic Reconnection:**
+- DirectLineJS handles connection failures with exponential backoff
+- Connection status changes trigger Redux actions for UI updates
+- Failed WebSocket connections automatically retry with increasing delays
+
+**Error Recovery:**
+```typescript
+// connectionStatusUpdateSaga.js
+function* observeConnectionStatus({ directLine }) {
+  yield observeEach(directLine.connectionStatus$, function* (connectionStatus) {
+    yield put(connectionStatusUpdate(connectionStatus));
+    
+    if (connectionStatus === ONLINE) {
+      // Connection restored - resume normal operations
+      yield put(connectionRestored());
+    } else if (connectionStatus === CONNECTING) {
+      // Reconnection in progress - show connecting indicator
+      yield put(reconnectionStarted());
+    }
+  });
+}
+```
+
+### WebSocket Message Types
+
+**Incoming Activity Types:**
+- **`message`**: Text/rich content from bot
+- **`typing`**: Typing indicators
+- **`conversationUpdate`**: Members added/removed
+- **`endOfConversation`**: Conversation termination
+- **`event`**: Custom bot events
+- **`invoke`**: Action requests from bot
+
+**Message Frame Structure:**
+```json
+{
+  "activities": [
+    {
+      "type": "message",
+      "id": "activity-id",
+      "timestamp": "2023-12-07T10:30:00.000Z",
+      "from": {
+        "id": "bot-id",
+        "name": "Bot Name",
+        "role": "bot"
+      },
+      "conversation": {
+        "id": "conversation-id"
+      },
+      "text": "Hello! How can I help you?",
+      "inputHint": "expectingInput",
+      "channelData": {
+        "postback": false
+      }
+    }
+  ],
+  "watermark": "12345"
+}
+```
+
+### Performance Optimizations
+
+**Connection Pooling:**
+- Single WebSocket connection handles all activity types
+- No separate connections for different message types
+- Reduces server load and improves reliability
+
+**Efficient Observable Processing:**
+```typescript
+// createPromiseQueue.js - Efficient async iteration
+function createPromiseQueue() {
+  const queue = [];
+  const resolvers = [];
+
+  return {
+    push: (value) => {
+      const resolver = resolvers.shift();
+      if (resolver) {
+        resolver(value); // Immediate resolution if saga is waiting
+      } else {
+        queue.push(value); // Queue for later if no waiting saga
+      }
+    },
+    shift: () => new Promise(resolve => {
+      const value = queue.shift();
+      if (value !== undefined) {
+        resolve(value); // Immediate value if available
+      } else {
+        resolvers.push(resolve); // Wait for next push
+      }
+    })
+  };
+}
+```
+
+### Debugging WebSocket Connections
+
+**Connection Monitoring:**
+```typescript
+// Debug WebSocket activity
+directLine.connectionStatus$.subscribe(status => 
+  console.log(`[WebChat] Connection status: ${status}`)
+);
+
+directLine.activity$.subscribe(activity => 
+  console.log(`[WebChat] Received activity:`, activity)
+);
+
+// Monitor WebSocket events in browser DevTools
+// Network tab → WS filter → Select WebSocket connection
+// Shows individual WebSocket frames and message content
+```
+
+**Common Issues:**
+- **Connection Drops**: Usually due to network changes or server restarts
+- **Token Expiration**: Causes authentication failures requiring new token
+- **Firewall/Proxy**: Corporate networks may block WebSocket connections
+- **Rate Limiting**: Too many rapid connections may be throttled
+
 ## Incoming Message Flow (Bot → User)
 
 ### Step-by-Step Process
 
-1. **WebSocket Event Reception**
+1. **WebSocket Connection & Event Reception**
+
+   The WebSocket implementation in Web Chat is handled through the `botframework-directlinejs` library, which provides an Observable-based interface to the Direct Line API. Here's how it works:
+
    ```typescript
-   // connectSaga.js establishes WebSocket subscription
+   // connectSaga.js establishes WebSocket connection and subscription
    function* connectSaga(directLine) {
-     // Subscribe to incoming activities
+     // DirectLineJS starts WebSocket connection only after first activity$ subscriber
      const activitySubscription = directLine.activity$.subscribe({
-       next: (activity) => {
-         // Dispatch action for each incoming activity
-         store.dispatch(queueIncomingActivity(activity));
-       },
-       error: (error) => {
-         console.error('Activity stream error:', error);
+       next: () => 0  // This triggers the WebSocket connection establishment
+     });
+     
+     // Wait for connection to be established
+     for (;;) {
+       const { payload: { connectionStatus } } = yield take(UPDATE_CONNECTION_STATUS);
+       
+       if (connectionStatus === ONLINE) {
+         // WebSocket is now connected and ready
+         return () => {
+           activitySubscription.unsubscribe();
+           directLine.end(); // Cleanup WebSocket connection
+         };
+       } else if (connectionStatus !== UNINITIALIZED && connectionStatus !== CONNECTING) {
+         throw new Error(`Failed to connect, DirectLineJS returned ${connectionStatus}.`);
        }
+     }
+   }
+   ```
+
+   **WebSocket Message Processing:**
+   ```typescript
+   // observeActivitySaga.ts - Processes each WebSocket message
+   function* observeActivity({ directLine, userID }) {
+     yield observeEach(directLine.activity$, function* (activity) {
+       // Each WebSocket frame triggers this function
+       console.log('WebSocket message received:', {
+         type: activity.type,
+         from: activity.from,
+         timestamp: activity.timestamp
+       });
+       
+       // Data normalization and validation
+       activity = patchNullAsUndefined(activity);
+       activity = patchActivityWithFromRole(activity, userID);
+       activity = patchFromName(activity);
+       
+       // Queue for Redux processing
+       yield put(queueIncomingActivity(activity));
      });
    }
    ```
@@ -400,3 +684,29 @@ const MyComponent = () => {
 ```
 
 This comprehensive message delivery system ensures reliable, ordered, and efficient communication between users and bots while providing extensive customization capabilities.
+
+## WebSocket Summary
+
+The WebSocket implementation in BotFramework-WebChat provides the real-time foundation for bot communication:
+
+### Key WebSocket Characteristics
+
+- **Lazy Connection**: WebSocket connects only when `directLine.activity$` gets its first subscriber
+- **Single Connection**: One WebSocket handles all activity types (messages, typing, events)
+- **Observable Streams**: ReactiveX pattern with `activity$` and `connectionStatus$` observables
+- **Automatic Management**: DirectLineJS handles connection lifecycle, reconnection, and error recovery
+- **Saga Integration**: Redux-Saga converts Observable events into Redux actions for state management
+
+### Connection Flow Summary
+```
+User Opens Chat → Subscribe to activity$ → WebSocket Connects → Receive Messages
+     ↓                     ↓                    ↓                  ↓
+DirectLine.activity$  → Observable Stream → Saga Processing → Redux Store → UI Updates
+```
+
+### WebSocket URL Pattern
+```
+wss://directline.botframework.com/v3/directline/conversations/{conversationId}/stream
+```
+
+This architecture ensures real-time message delivery while maintaining clean separation between the transport layer (WebSocket), business logic (Sagas), and presentation layer (React components).
