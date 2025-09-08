@@ -2,6 +2,11 @@
 
 This documentation provides a comprehensive guide to understanding the architecture of BotFramework-WebChat, specifically focusing on how messages are delivered to users.
 
+## Quick Navigation
+
+### 📋 [ARCHITECTURE_SUMMARY.md](./ARCHITECTURE_SUMMARY.md) ⭐ **START HERE**
+Executive summary with key concepts, implementation highlights, and integration examples.
+
 ## Documentation Overview
 
 ### 📋 [ARCHITECTURE.md](./ARCHITECTURE.md)
